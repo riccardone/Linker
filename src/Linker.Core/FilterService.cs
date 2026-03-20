@@ -1,4 +1,6 @@
-﻿namespace Linker.Core;
+﻿using System.Text.Json.Nodes;
+
+namespace Linker.Core;
 
 public class FilterService : IFilterService
 {
@@ -26,114 +28,68 @@ public class FilterService : IFilterService
 
     public bool IsValid(string eventType, string eventStreamId)
     {
+        return IsValid(eventType, eventStreamId, null);
+    }
+
+    public bool IsValid(string eventType, string eventStreamId, IDictionary<string, JsonNode?>? metadata)
+    {
         if (!_filters.Any())
             return true;
 
-        var shouldBeExcluded = _filters.ContainsKey(FilterOperation.Exclude) && IsExcludedByFilters(eventType, eventStreamId, _filters[FilterOperation.Exclude]);
-        var shouldBeIncluded = !_filters.ContainsKey(FilterOperation.Include) || IsIncludedByFilters(eventType, eventStreamId, _filters[FilterOperation.Include]);
+        var shouldBeExcluded = _filters.ContainsKey(FilterOperation.Exclude) && IsExcludedByFilters(eventType, eventStreamId, metadata, _filters[FilterOperation.Exclude]);
+        var shouldBeIncluded = !_filters.ContainsKey(FilterOperation.Include) || IsIncludedByFilters(eventType, eventStreamId, metadata, _filters[FilterOperation.Include]);
 
         return !shouldBeExcluded && shouldBeIncluded;
     }
 
-    private static bool IsIncludedByFilters(string eventType, string eventStreamId, List<Filter> filters)
+    private static bool IsIncludedByFilters(string eventType, string eventStreamId, IDictionary<string, JsonNode?>? metadata, List<Filter> filters)
     {
         if (filters == null || !filters.Any())
             return true;
 
-        var shouldIncludeByStream = filters.Any(f => f.FilterType == FilterType.Stream && IsIncludedByStream(eventStreamId, f));
-        var shouldIncludeByEventType = filters.Any(f => f.FilterType == FilterType.EventType && IsIncludedByEventType(eventType, f));
+        var shouldIncludeByStream = filters.Any(f => f.FilterType == FilterType.Stream && IsMatch(eventStreamId, f.Value));
+        var shouldIncludeByEventType = filters.Any(f => f.FilterType == FilterType.EventType && IsMatch(eventType, f.Value));
+        var shouldIncludeByMetadata = filters.Any(f => f.FilterType == FilterType.Metadata && IsMetadataMatch(metadata, f.Value));
 
-        return shouldIncludeByEventType || shouldIncludeByStream;
+        return shouldIncludeByEventType || shouldIncludeByStream || shouldIncludeByMetadata;
     }
 
-    private static bool IsExcludedByFilters(string eventType, string eventStreamId, List<Filter> filters)
+    private static bool IsExcludedByFilters(string eventType, string eventStreamId, IDictionary<string, JsonNode?>? metadata, List<Filter> filters)
     {
         if (filters == null || !filters.Any())
             return false;
 
-        var shouldExcludeByStream = filters.Any(f => f.FilterType == FilterType.Stream && IsExcludedByStream(eventStreamId, f));
-        var shouldExcludeByEventType = filters.Any(f => f.FilterType == FilterType.EventType && IsExcludedByEventType(eventType, f));
+        var shouldExcludeByStream = filters.Any(f => f.FilterType == FilterType.Stream && IsMatch(eventStreamId, f.Value));
+        var shouldExcludeByEventType = filters.Any(f => f.FilterType == FilterType.EventType && IsMatch(eventType, f.Value));
+        var shouldExcludeByMetadata = filters.Any(f => f.FilterType == FilterType.Metadata && IsMetadataMatch(metadata, f.Value));
 
-        return shouldExcludeByStream || shouldExcludeByEventType;
+        return shouldExcludeByStream || shouldExcludeByEventType || shouldExcludeByMetadata;
     }
 
-    private static bool IsExcludedByEventType(string eventType, Filter replicaFilter)
+    private static bool IsMatch(string actual, string pattern)
     {
-        if (replicaFilter.Value.EndsWith("*"))
-        {
-            if (eventType.StartsWith(replicaFilter.Value.TrimEnd('*')))
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (eventType.Equals(replicaFilter.Value))
-            {
-                return true;
-            }
-        }
+        if (pattern.EndsWith("*"))
+            return actual.StartsWith(pattern.TrimEnd('*'));
 
-        return false;
+        return actual.Equals(pattern);
     }
 
-    private static bool IsIncludedByEventType(string eventType, Filter replicaFilter)
+    private static bool IsMetadataMatch(IDictionary<string, JsonNode?>? metadata, string filterValue)
     {
-        if (replicaFilter.Value.EndsWith("*"))
-        {
-            if (eventType.StartsWith(replicaFilter.Value.TrimEnd('*')))
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (eventType.Equals(replicaFilter.Value))
-            {
-                return true;
-            }
-        }
+        if (metadata == null)
+            return false;
 
-        return false;
-    }
+        var separatorIndex = filterValue.IndexOf(':');
+        if (separatorIndex < 0)
+            return false;
 
-    private static bool IsExcludedByStream(string eventStreamId, Filter replicaFilter)
-    {
-        if (replicaFilter.Value.EndsWith("*"))
-        {
-            if (eventStreamId.StartsWith(replicaFilter.Value.TrimEnd('*')))
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (eventStreamId.Equals(replicaFilter.Value))
-            {
-                return true;
-            }
-        }
+        var key = filterValue[..separatorIndex];
+        var valuePattern = filterValue[(separatorIndex + 1)..];
 
-        return false;
-    }
+        if (!metadata.TryGetValue(key, out var node) || node is null)
+            return false;
 
-    private static bool IsIncludedByStream(string eventStreamId, Filter replicaFilter)
-    {
-        if (replicaFilter.Value.EndsWith("*"))
-        {
-            if (eventStreamId.StartsWith(replicaFilter.Value.TrimEnd('*')))
-            {
-                return true;
-            }
-        }
-        else
-        {
-            if (eventStreamId.Equals(replicaFilter.Value))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        var actual = node.ToString();
+        return IsMatch(actual, valuePattern);
     }
 }

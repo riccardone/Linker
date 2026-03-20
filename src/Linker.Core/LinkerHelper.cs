@@ -23,7 +23,7 @@ public class LinkerHelper
         if (eventType.Equals(positionEventType) || !originalPosition.HasValue)
             return false;
 
-        if (filterService != null && !filterService.IsValid(eventType, eventStreamId))
+        if (filterService != null && !filterService.IsValid(eventType, eventStreamId, metadata))
             return false;
 
         

@@ -9,7 +9,8 @@ public enum FilterOperation
 public enum FilterType
 {
     Stream,
-    EventType
+    EventType,
+    Metadata
 }
 
 public class Filter

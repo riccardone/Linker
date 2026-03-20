@@ -1,4 +1,6 @@
-﻿using Linker.Core;
+﻿using System.Collections.Generic;
+using System.Text.Json.Nodes;
+using Linker.Core;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 
@@ -186,5 +188,117 @@ public class FilterServiceTests
         ClassicAssert.False(invalid1);
         ClassicAssert.False(invalid2);
         ClassicAssert.True(valid);
+    }
+
+    [Test]
+    public void can_include_events_using_metadata_filter()
+    {
+        // PREPARE
+        var filter = new Filter(FilterType.Metadata, "tenant-id:123", FilterOperation.Include);
+        var sut = new FilterService(filter);
+
+        var matchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("123") } };
+        var nonMatchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("456") } };
+
+        // RUN
+        var valid = sut.IsValid("someEvent", "someStream", matchingMetadata);
+        var invalid = sut.IsValid("someEvent", "someStream", nonMatchingMetadata);
+
+        // ASSERT
+        ClassicAssert.True(valid);
+        ClassicAssert.False(invalid);
+    }
+
+    [Test]
+    public void can_exclude_events_using_metadata_filter()
+    {
+        // PREPARE
+        var filter = new Filter(FilterType.Metadata, "tenant-id:123", FilterOperation.Exclude);
+        var sut = new FilterService(filter);
+
+        var matchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("123") } };
+        var nonMatchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("456") } };
+
+        // RUN
+        var invalid = sut.IsValid("someEvent", "someStream", matchingMetadata);
+        var valid = sut.IsValid("someEvent", "someStream", nonMatchingMetadata);
+
+        // ASSERT
+        ClassicAssert.False(invalid);
+        ClassicAssert.True(valid);
+    }
+
+    [Test]
+    public void can_include_events_using_metadata_wildcard_filter()
+    {
+        // PREPARE
+        var filter = new Filter(FilterType.Metadata, "tenant-id:12*", FilterOperation.Include);
+        var sut = new FilterService(filter);
+
+        var matchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("123") } };
+        var alsoMatchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("129") } };
+        var nonMatchingMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("456") } };
+
+        // RUN
+        var valid1 = sut.IsValid("someEvent", "someStream", matchingMetadata);
+        var valid2 = sut.IsValid("someEvent", "someStream", alsoMatchingMetadata);
+        var invalid = sut.IsValid("someEvent", "someStream", nonMatchingMetadata);
+
+        // ASSERT
+        ClassicAssert.True(valid1);
+        ClassicAssert.True(valid2);
+        ClassicAssert.False(invalid);
+    }
+
+    [Test]
+    public void metadata_filter_returns_false_when_metadata_is_null()
+    {
+        // PREPARE
+        var filter = new Filter(FilterType.Metadata, "tenant-id:123", FilterOperation.Include);
+        var sut = new FilterService(filter);
+
+        // RUN
+        var result = sut.IsValid("someEvent", "someStream", null);
+
+        // ASSERT
+        ClassicAssert.False(result);
+    }
+
+    [Test]
+    public void metadata_filter_returns_false_when_key_not_present()
+    {
+        // PREPARE
+        var filter = new Filter(FilterType.Metadata, "tenant-id:123", FilterOperation.Include);
+        var sut = new FilterService(filter);
+
+        var metadata = new Dictionary<string, JsonNode?> { { "other-key", JsonValue.Create("123") } };
+
+        // RUN
+        var result = sut.IsValid("someEvent", "someStream", metadata);
+
+        // ASSERT
+        ClassicAssert.False(result);
+    }
+
+    [Test]
+    public void can_combine_metadata_and_stream_filters()
+    {
+        // PREPARE
+        var streamFilter = new Filter(FilterType.Stream, "orders-*", FilterOperation.Include);
+        var metadataFilter = new Filter(FilterType.Metadata, "tenant-id:123", FilterOperation.Exclude);
+        var sut = new FilterService(streamFilter, metadataFilter);
+
+        var tenantMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("123") } };
+        var otherTenantMetadata = new Dictionary<string, JsonNode?> { { "tenant-id", JsonValue.Create("456") } };
+
+        // RUN
+        var excluded = sut.IsValid("someEvent", "orders-100", tenantMetadata);
+        var included = sut.IsValid("someEvent", "orders-100", otherTenantMetadata);
+        var notIncluded = sut.IsValid("someEvent", "other-stream", otherTenantMetadata);
+
+        // ASSERT
+        ClassicAssert.False(excluded);
+        ClassicAssert.True(included);
+        ClassicAssert.False(notIncluded);
     }
 }
