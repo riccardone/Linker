@@ -226,12 +226,46 @@ await service.StartAsync();
 
 ## Backpressure and performance
 
-Linker uses a bounded `System.Threading.Channels.Channel` between the subscription reader and the writer. When the buffer is full the reader waits - this is the backpressure mechanism.
-
-- **`AutomaticTuning = true`** - the buffer size is dynamically adjusted based on throughput and latency samples.
-- **`AutomaticTuning = false`** - the buffer stays at the configured `BufferSize`. Backpressure still applies but the size never changes.
+Linker uses a bounded `System.Threading.Channels.Channel` between the subscription reader (producer) and the writer (consumer). When the buffer is full the reader pauses until the writer drains space - this is the backpressure mechanism.
 
 `BufferSize` is clamped between **1** and **1000**.
+
+### Automatic tuning
+
+| Setting | Behaviour |
+|---------|-----------|
+| `AutomaticTuning = false` | The buffer stays at the configured `BufferSize`. Backpressure still applies but the size never changes. |
+| `AutomaticTuning = true` | Every 5 stats intervals Linker compares the recent replication throughput with the previous window. If throughput is steady or improving the buffer grows (up to 1000); if it regresses significantly the buffer shrinks (down to 1). Each adjustment is ±15 % of the current size. |
+
+### Reading the stats log
+
+Linker logs a stats line every 3 seconds:
+
+```
+From-db01-To-db02 stats: replicated 14 events, total: 20, buffer: 0/1000 (0%), latency: 68ms, progress: 6.3%
+```
+
+| Field | Meaning |
+|-------|---------|
+| `replicated 14 events` | Events written to the destination since the last stats tick. |
+| `total: 20` | Cumulative events written since the service started. |
+| `buffer: 0/1000 (0%)` | Events currently waiting in the channel / channel capacity. |
+| `latency: 68ms` | Average write latency for events in this interval. |
+| `progress: 6.3%` | How far the current read position is relative to the origin's `$all` stream end at startup. |
+
+**A buffer that stays near 0 is healthy.** It means the writer keeps up with the reader and events flow through without queuing. You would see the buffer fill when:
+
+- There is a large backlog to catch up on (e.g. after a restart with thousands of unprocessed events).
+- The destination is slower than the origin (high network latency, disk I/O pressure).
+- The buffer approaches capacity and backpressure kicks in, pausing the subscription until the writer drains it.
+
+When `AutomaticTuning` is enabled you will also see a tuning line every 5 intervals:
+
+```
+From-db01-To-db02 adaptive tuning: prevAvg=13.0, currentAvg=13.8, proposed bufferSize=1000, change=6.2%
+```
+
+This shows the throughput comparison (`prevAvg` vs `currentAvg`), the buffer size Linker decided on, and the percentage change between windows.
 
 ---
 
