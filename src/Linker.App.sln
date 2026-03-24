@@ -19,6 +19,12 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "instructions", "instruction
 		..\.github\instructions\general.instructions.md = ..\.github\instructions\general.instructions.md
 	EndProjectSection
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "workflows", "workflows", "{5A2F3B40-4C73-4461-9840-7BD2B1BC241E}"
+	ProjectSection(SolutionItems) = preProject
+		..\.github\workflows\ci.yml = ..\.github\workflows\ci.yml
+		..\.github\workflows\release.yml = ..\.github\workflows\release.yml
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -43,6 +49,7 @@ Global
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{0E6856FE-A836-4C6A-A6C2-5206F06BB834} = {9F150BF0-2375-448B-B38B-72CB158ABB8E}
+		{5A2F3B40-4C73-4461-9840-7BD2B1BC241E} = {9F150BF0-2375-448B-B38B-72CB158ABB8E}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {2C2F15EE-CC99-4DAC-A96F-5DE9C2AA70EC}

@@ -18,10 +18,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup .NET 9
-        uses: actions/setup-dotnet@v3
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: '10.0.x'
 
       - name: Restore dependencies
         run: dotnet restore src/Linker.App.sln
@@ -76,7 +76,7 @@ jobs:
       - name: Archive macOS build
         run: zip -r linker-osx-arm64.zip out-macos
 
-      # ⬇️ NEW STEP: Docker Build & Push
+      # ⬇️ Docker Build & Push
       - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
@@ -106,7 +106,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload GitHub release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.changelog.outputs.changelog }}
           files: |
