@@ -1,51 +1,254 @@
 [![Build and Test](https://github.com/riccardone/Linker/actions/workflows/ci.yml/badge.svg)](https://github.com/riccardone/Linker/actions/workflows/ci.yml)
 
-# Linker: a tool for KurrentDb (former EventStore) cross cluster replication
-To run this program download the [latest version](https://github.com/riccardone/Linker/releases) or run as a [Docker container](https://hub.docker.com/r/riccardone/linker).
-This library is for replicating user data between EventStore clusters or single instances. More info on this article [Cross Data Center Replication with Linker](http://www.dinuzzo.co.uk/2019/11/17/cross-data-center-replication-with-linker/)
+# Linker
+
+Cross-cluster replication tool for [KurrentDb](https://github.com/kurrent-io/KurrentDB) (formerly EventStore).
+
+Linker reads events from an **origin** KurrentDb instance and writes them to a **destination**, preserving ordering and handling conflicts. Multiple replication links can run simultaneously to support advanced topologies such as active-active, fan-out and fan-in.
+
+More background: [Cross Data Center Replication with Linker](http://www.dinuzzo.co.uk/2019/11/17/cross-data-center-replication-with-linker/)
 
 ![image](https://github.com/user-attachments/assets/aff928d0-37d3-4624-8021-1e4dde7f62b7)
 
-Configure the origin and the destination of the data replication. Eact Link is between Origin and Destination. It is possible run multiple links at the same time for complex scenarios. To enforce ordering in the destination db Linker save stream positions on disk in a folder called data per default. Path is configurable as a setting if needed.
+## Getting started
 
-# Configuration 
-This app make use of the appsettings.json file to configure Linked KurrentDb's. 
-You can have as many Links as you need and as your running machine allow you to run. Even when you are replicating at full speed, the Linker logic make use of **backpressure** tecnique in order to not take the full amount of CPU and Memory available.  
+| Method | Link |
+|--------|------|
+| Download a release | [Latest release](https://github.com/riccardone/Linker/releases) |
+| Docker image | [riccardone/linker](https://hub.docker.com/r/riccardone/linker) |
+| NuGet package (programmatic use) | `Linker.Core` on NuGet |
 
-The following properties can be configured in the root of your appsettings.json file. If not set, the default values shown will be used:
-```
+---
+
+## How to configure Linker
+
+Linker can be configured in three ways. Pick whichever suits your deployment model.
+
+### 1. Config file (`appsettings.json`)
+
+The standalone application reads `appsettings.json` (or a custom path set via the `LINKER_CONFIG_PATH` environment variable). Environment-specific overrides such as `appsettings.production.json` are also supported.
+
+#### Global settings
+
+The following properties are set at the root level. Default values are shown:
+
+```jsonc
 {
-  "DataFolder": "data",               // Folder used to store stream position files
-  "AutomaticTuning": true,           // Enables or disables dynamic buffer size tuning
-  "BufferSize": 100,                 // Initial size of the bounded buffer channel
-  "HandleConflicts": true,           // Enables appending conflicts to a special stream instead of failing
-  "ResolveLinkTos": false,           // Whether to resolve $> link events in EventStore
-  "InteractiveMode": true,           // Set it to true when you debug locally and you want to pross O or D on the keyboard to add test events
-  "EnableReconciliation": false,     // Set it to true to ensure all the write positions of the streams are updated at start 
-  "Links": []                        // List of replication links (see examples below)
+  "DataFolder": "data",             // Folder for stream-position files (must be persistent storage)
+  "AutomaticTuning": false,         // Dynamically resize the bounded buffer based on throughput
+  "BufferSize": 100,                // Initial bounded-buffer size (clamped to 1-1000)
+  "HandleConflicts": true,          // Write conflicts to a special stream instead of failing
+  "ResolveLinkTos": false,          // Resolve $> link events in KurrentDb
+  "InteractiveMode": false,         // Enable keyboard shortcuts (O/D/E) for manual testing
+  "EnableReconciliation": false,    // Verify per-stream write positions on startup
+  "Links": []                       // One or more replication links (see below)
 }
 ```
 
-Each Link object defines one replication pair:
-```
+#### Link definition
+
+Each entry in `Links` pairs an **origin** with a **destination** and an optional set of **filters**:
+
+```jsonc
 {
   "origin": {
-    "connectionString": "esdb://...",
+    "connectionString": "esdb://admin:changeit@db01:2113?tls=false",
     "connectionName": "db01",
-    "certificate": null,            // Optional client certificate (PEM format)
-    "certificatePrivateKey": null   // Optional private key for the certificate
+    "certificate": null,              // Inline PEM certificate (optional)
+    "certificatePrivateKey": null,    // Inline PEM private key (optional)
+    "certificateFile": null,          // Path to a PEM certificate file (optional)
+    "privateKeyFile": null            // Path to a PEM private-key file (optional)
   },
   "destination": {
-    "connectionString": "esdb://...",
+    "connectionString": "esdb://admin:changeit@db02:2113?tls=false",
     "connectionName": "db02",
     "certificate": null,
-    "certificatePrivateKey": null
+    "certificatePrivateKey": null,
+    "certificateFile": null,
+    "privateKeyFile": null
   },
-  "filters": []                      // Optional list of filters (see filter section)
+  "filters": []
 }
 ```
-If you run the Docker image [available here](https://hub.docker.com/r/riccardone/linker), this is an example configuration to be set in mounted volumes
+
+> TLS certificates can be provided either inline (PEM strings) or as file paths. When neither is supplied, Linker connects without client certificates.
+
+### 2. CLI / environment variables
+
+Because the app is built on `Microsoft.Extensions.Configuration`, every setting can also be passed as an environment variable using the standard `__` separator (e.g. `Links__0__Origin__ConnectionString`).
+
+### 3. NuGet package (programmatic)
+
+Reference the `Linker.Core` NuGet package and build a `LinkerService` directly:
+
+```csharp
+var origin = new LinkerConnectionBuilder(
+    KurrentDBClientSettings.Create("esdb://admin:changeit@localhost:2114?tls=false"),
+    "db01", cert: null);
+
+var destination = new LinkerConnectionBuilder(
+    KurrentDBClientSettings.Create("esdb://admin:changeit@localhost:2115?tls=false"),
+    "db02", cert: null);
+
+var service = new LinkerService(
+    origin, destination,
+    positionRepository,
+    new FilterService(
+        new Filter(FilterType.Stream, "domain-*", FilterOperation.Include),
+        new Filter(FilterType.EventType, "Basket*", FilterOperation.Exclude)),
+    settings,
+    adjustedStreamRepository,
+    loggerFactory);
+
+await service.StartAsync();
 ```
+
+---
+
+## Replication topologies
+
+### Active-Passive
+
+One-way replication from origin to destination:
+
+```json
+{
+  "links": [
+    {
+      "origin":      { "connectionString": "esdb://admin:changeit@localhost:2114?tls=false", "connectionName": "db01" },
+      "destination": { "connectionString": "esdb://admin:changeit@localhost:2115?tls=false", "connectionName": "db02" },
+      "filters": [
+        { "filterType": "stream", "value": "diary-input", "filterOperation": "exclude" },
+        { "filterType": "stream", "value": "*",           "filterOperation": "include" }
+      ]
+    }
+  ]
+}
+```
+
+### Active-Active
+
+Define two links that mirror each other. Linker uses `$origin` metadata to prevent infinite loops:
+
+```json
+{
+  "links": [
+    {
+      "origin":      { "connectionString": "esdb://admin:changeit@localhost:2114?tls=false", "connectionName": "db01" },
+      "destination": { "connectionString": "esdb://admin:changeit@localhost:2115?tls=false", "connectionName": "db02" },
+      "filters": []
+    },
+    {
+      "origin":      { "connectionString": "esdb://admin:changeit@localhost:2115?tls=false", "connectionName": "db02" },
+      "destination": { "connectionString": "esdb://admin:changeit@localhost:2114?tls=false", "connectionName": "db01" },
+      "filters": []
+    }
+  ]
+}
+```
+
+### Fan-Out
+
+Use the same origin in multiple links, each pointing to a different destination.
+
+### Fan-In
+
+Use different origins in multiple links, all pointing to the same destination.
+
+---
+
+## Filters
+
+Filters control which events are replicated. Without any filters every user event is replicated.
+
+| Filter type | Description | Wildcard support |
+|-------------|-------------|------------------|
+| `stream` | Match on stream name | `*` (e.g. `domain-*`) |
+| `eventType` | Match on event type | `*` (e.g. `User*`) |
+| `metadata` | Match on event metadata keys | - |
+
+Each filter specifies an **operation**: `include` or `exclude`.
+
+> **Rule**: if you add an `exclude` filter you must also add at least one `include` filter so Linker knows what else to replicate.
+
+### Examples
+
+**Include only specific streams:**
+
+```csharp
+var filter = new Filter(FilterType.Stream, "domain-*", FilterOperation.Include);
+```
+
+**Exclude streams by prefix:**
+
+```csharp
+var filter = new Filter(FilterType.Stream, "rawdata-*", FilterOperation.Exclude);
+```
+
+**Include by event type:**
+
+```csharp
+var filter = new Filter(FilterType.EventType, "User*", FilterOperation.Include);
+```
+
+**Exclude by event type:**
+
+```csharp
+var filter = new Filter(FilterType.EventType, "Basket*", FilterOperation.Exclude);
+```
+
+**Combine filters (programmatic):**
+
+```csharp
+var service = new LinkerService(origin, destination,
+    positionRepository,
+    new FilterService(
+        new Filter(FilterType.EventType, "User*",    FilterOperation.Include),
+        new Filter(FilterType.Stream,    "domain-*", FilterOperation.Include),
+        new Filter(FilterType.EventType, "Basket*",  FilterOperation.Exclude)),
+    settings,
+    adjustedStreamRepository,
+    loggerFactory);
+
+await service.StartAsync();
+```
+
+**Combine filters (config file):**
+
+```json
+"filters": [
+  { "filterType": "stream",    "value": "diary-input", "filterOperation": "exclude" },
+  { "filterType": "stream",    "value": "*",           "filterOperation": "include" }
+]
+```
+
+---
+
+## Backpressure and performance
+
+Linker uses a bounded `System.Threading.Channels.Channel` between the subscription reader and the writer. When the buffer is full the reader waits - this is the backpressure mechanism.
+
+- **`AutomaticTuning = true`** - the buffer size is dynamically adjusted based on throughput and latency samples.
+- **`AutomaticTuning = false`** - the buffer stays at the configured `BufferSize`. Backpressure still applies but the size never changes.
+
+`BufferSize` is clamped between **1** and **1000**.
+
+---
+
+## Docker
+
+```bash
+docker run --rm \
+  -v $(pwd)/config:/config \
+  -v $(pwd)/certs:/certs \
+  -v $(pwd)/data:/data \
+  -e LINKER_CONFIG_PATH=/config/appsettings.json \
+  riccardone/linker:latest
+```
+
+Example `/config/appsettings.json` for Docker:
+
+```json
 {
   "DataFolder": "/data",
   "links": [
@@ -67,125 +270,11 @@ If you run the Docker image [available here](https://hub.docker.com/r/riccardone
   ]
 }
 ```
-Docker Run Example
-```
-docker run --rm \
-  -v $(pwd)/config:/config \
-  -v $(pwd)/certs:/certs \
-  -v $(pwd)/data:/data \
-  -e LINKER_CONFIG_PATH=/config/appsettings.json \
-  linker-app:latest
-```
 
-## Active-Passive
-One instance is the origin, the other instance is the destination. To configure a simple link with a filter excluding one specific stream:
-```
-{
-  "links": [
-    {
-      "origin": {
-        "connectionString": "esdb://admin:changeit@localhost:2114?tls=false",
-        "connectionName": "db01"
-      },
-      "destination": {
-        "connectionString": "esdb://admin:changeit@localhost:2115?tls=false",
-        "connectionName": "db02"
-      },
-      "filters": [
-        {
-          "filterType": "stream",
-          "value": "diary-input",
-          "filterOperation": "exclude"
-        },
-        {
-          "filterType": "stream",
-          "value": "*",
-          "filterOperation": "include"
-        }
-      ]
-    }
-  ]
-}
-```
+Mount points:
 
-## Active-Active  
-Configure two links swapping the same Origin and Destination for a **multi master** ACTIVE-ACTIVE replication  
-```
-{
-  "links": [
-    {
-      "origin": {
-        "connectionString": "esdb://admin:changeit@localhost:2114?tls=false",
-        "connectionName": "db01"
-      },
-      "destination": {
-        "connectionString": "esdb://admin:changeit@localhost:2115?tls=false",
-        "connectionName": "db02"
-      },
-      "filters": []
-    },
-    {
-      "origin": {
-        "connectionString": "esdb://admin:changeit@localhost:2115?tls=false",
-        "connectionName": "db02"
-      },
-      "destination": {
-        "connectionString": "esdb://admin:changeit@localhost:2114?tls=false",
-        "connectionName": "db01"
-      },
-      "filters": []
-    }
-  ]
-}
-```
-## Fan-Out
-Configure the same Origin in separate Links replicating data to different destination for a **Fan-Out** solution.  
-
-## Fan-In
-You can have separate Links with different Origins linked with the same Destination for a **Fan-In** solution. 
- 
-# Use filters 
-Without filters, all the user data will be replicated from the Origin to the linked Destination. When you add an exclude filter you must also add at least an include filter to include what else can be replicated.
-
-## Include streams filters
-You can set a inclusion filter to specify which stream or streams are to be replicated. This will automatically exclude anything else. You can use the wildcard * in the stream string so that you can include any stream that start with 'domain-*' for example.  
-Example to create an inclusive stream filter  
-```c#
-var filter = new Filter(FilterType.Stream, "domain-*", FilterOperation.Include);
-```
-## Exclude streams filters 
-You can set a filter to exclude one or more streams that are not to be replicated. This will automatically include anything else. You can use the wildcard * in the stream string so that you can exclude any stream that start with 'rawdata-*' for example.  
-Example to create a filter that exclude all streams starting with the word rawdata- 
-```c#
-var filter = new Filter(FilterType.Stream, "rawdata-*", FilterOperation.Exclude);
-```
-## Include EventType filters  
-You can set a inclusion filter to specify which Event Type's are to be replicated. This will automatically exclude any other event type. You can use the wildcard * in the event type string so that you can include any event type that for exampe starts with 'User*'.  
-Example to create an inclusive stream filter  
-```c#
-var filter = new Filter(FilterType.EventType, "User*", FilterOperation.Include);
-```
-## Exclude EventType filters 
-You can set a filter to exclude one or more EventType's that must not be replicated. This will automatically include any other event type. You can use the wildcard * in the event type string so that you can exclude any event type that for example start with the word Basket.  
-Example to create a filter that exclude all streams starting with the word Basket 
-```c#
-var filter = new Filter(FilterType.EventType, "Basket*", FilterOperation.Exclude);
-```
-## Combine filters
-Use of filters is optional. If you don't set any filter then all the user data will be replicated from origin to destination. If you set for example an Exclude filter then you must set one or more Include to include for example all other streams or eventtypes or only a subset.  
-Following is an example of building the LinkerService with a couple of Include filters and one Exclude
-```c#
-            var service = new LinkerService(origin, destination, 
-                new FilterService(new List<Filter>
-                {
-                    new Filter(FilterType.EventType, "User*", FilterOperation.Include),
-                    new Filter(FilterType.Stream, "domain-*", FilterOperation.Include),
-                    new Filter(FilterType.EventType, "Basket*", FilterOperation.Exclude)
-                }), 1000, false);
-            service.Start().Wait();
-```
-# Backpressure and performances 
-One of the problem that this tool solves is related to the lack of built-in backpressure management in the KurrentDb client's and api's. Running the replication with this program, the logic will continuosly adapt the network settings depending on the number of events being replicated. To dynamically adapt the backpressure, make sure to set the AutomaticTuning=true setting. If you set it to false, the buffersize will be kept the same. This is still back pressure with the difference that it's not dynamically adapting.
-
-# KurrentDb
-The database being replicated is KurrentDb https://github.com/kurrent-io/KurrentDB 
+| Path | Purpose |
+|------|---------|
+| `/config` | Configuration files |
+| `/certs` | TLS certificates |
+| `/data` | Persistent stream-position storage |
