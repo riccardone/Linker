@@ -115,13 +115,13 @@ Each `Origin` / `Destination` supports four optional certificate fields:
 
 Filters are optional. Without filters all user events are replicated. Three filter types exist:
 
-| `FilterType` | Matches on |
-|--------------|------------|
-| `Stream` | `eventStreamId` |
-| `EventType` | `eventType` |
-| `Metadata` | Event metadata keys |
+| `FilterType` | Matches on | `Value` format |
+|--------------|------------|----------------|
+| `Stream` | `eventStreamId` | Stream name or prefix with `*` wildcard (e.g. `domain-*`). |
+| `EventType` | `eventType` | Event type name or prefix with `*` wildcard (e.g. `User*`). |
+| `Metadata` | Event metadata | `key:value` — the key is looked up in the event's JSON metadata and the value is compared. The value side supports `*` wildcard (e.g. `tenant-id:abc123` or `tenant-id:abc*`). Implemented in `FilterService.IsMetadataMatch()`. |
 
-Each filter has a `Value` (supports `*` wildcard) and a `FilterOperation` (`Include` or `Exclude`).
+Each filter has a `FilterOperation` (`Include` or `Exclude`).
 
 **Important rule**: if you add an `Exclude` filter you must also add at least one `Include` filter.
 

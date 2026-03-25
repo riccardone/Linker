@@ -165,7 +165,7 @@ Filters control which events are replicated. Without any filters every user even
 |-------------|-------------|------------------|
 | `stream` | Match on stream name | `*` (e.g. `domain-*`) |
 | `eventType` | Match on event type | `*` (e.g. `User*`) |
-| `metadata` | Match on event metadata keys | - |
+| `metadata` | Match on event metadata value using `key:value` format | `*` on the value (e.g. `tenant-id:abc*`) |
 
 Each filter specifies an **operation**: `include` or `exclude`.
 
@@ -195,6 +195,28 @@ var filter = new Filter(FilterType.EventType, "User*", FilterOperation.Include);
 
 ```csharp
 var filter = new Filter(FilterType.EventType, "Basket*", FilterOperation.Exclude);
+```
+
+**Include by metadata (e.g. replicate only a specific tenant):**
+
+Metadata filters use a `key:value` format. Linker looks up the key in the event's metadata and matches the value. The value side supports the `*` wildcard.
+
+```csharp
+var filter = new Filter(FilterType.Metadata, "tenant-id:abc123", FilterOperation.Include);
+```
+
+In a config file:
+
+```json
+"filters": [
+  { "filterType": "metadata", "value": "tenant-id:abc123", "filterOperation": "include" }
+]
+```
+
+You can also use a wildcard to match several tenants:
+
+```json
+{ "filterType": "metadata", "value": "tenant-id:abc*", "filterOperation": "include" }
 ```
 
 **Combine filters (programmatic):**
