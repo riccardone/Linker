@@ -15,14 +15,16 @@ public class LinkerConnectionBuilder(
     public KurrentDBClient Build()
     {
         ConnectionSettings.DefaultDeadline = TimeSpan.FromSeconds(30);
-        ConnectionSettings.CreateHttpMessageHandler = () =>
+        if (cert != null)
         {
-            var handler = new HttpClientHandler();
-            if (cert == null) return handler;
-            handler.ClientCertificates.Add(cert);
-            handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true;
-            return handler;
-        };
+            ConnectionSettings.CreateHttpMessageHandler = () =>
+            {
+                var handler = new HttpClientHandler();
+                handler.ClientCertificates.Add(cert);
+                handler.ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true;
+                return handler;
+            };
+        }
         return new KurrentDBClient(ConnectionSettings);
     }
 }
