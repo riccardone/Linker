@@ -59,7 +59,6 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     private long _replicatedSinceLastStats;
     private long _replicatedTotal;
 
-    private readonly double _currentBackpressureThreshold = 0.8;
     private readonly List<long> _latencySamples = [];
     private readonly List<long> _replicationSamples = [];
     private readonly Lock _adaptiveLock = new();
@@ -71,7 +70,13 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     public const int MaxAllowedBuffer = 1000;
     public const int MinAllowedBuffer = 1;
     private const int StatsIntervalMs = 3000;
+    private const int MaxAppendBatchSize = 100;
+    private const int MaxAppendBatchBytes = 256 * 1024;
+    private const int MaxConcurrentStreamAppends = 8;
     private static readonly TimeSpan ResubscribeDelay = TimeSpan.FromSeconds(5);
+    private readonly SemaphoreSlim _appendConcurrency = new(MaxConcurrentStreamAppends, MaxConcurrentStreamAppends);
+    private readonly Lock _adjustedLock = new();
+    private readonly SemaphoreSlim _adjustedSaveLock = new(1, 1);
 
     private readonly ConcurrentDictionary<string, SortedDictionary<ulong, BufferedEvent>> _perStreamBuffers = new();
     private readonly ConcurrentDictionary<string, ulong?> _lastWrittenPerStream = new();
@@ -188,11 +193,14 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         _scanRatePerSecond = 0;
         _stalledIntervals = 0;
 
-        _adjustedStartStreams.Clear();
         var loaded = await _adjustedStreamRepository.LoadAsync();
-        foreach (var s in loaded)
-            _adjustedStartStreams.Add(s);
-        _logger.LogInformation($"{Name}: Loaded {_adjustedStartStreams.Count} adjusted start streams from disk");
+        lock (_adjustedLock)
+        {
+            _adjustedStartStreams.Clear();
+            foreach (var s in loaded)
+                _adjustedStartStreams.Add(s);
+        }
+        _logger.LogInformation($"{Name}: Loaded {loaded.Count} adjusted start streams from disk");
 
         _destinationConnection = _destinationConnectionBuilder.Build();
         _originConnection = _originConnectionBuilder.Build();
@@ -340,7 +348,8 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         _logger.LogDebug($"{Name}: Channel processing started");
         try
         {
-            await foreach (var evt in _channel.Reader.ReadAllAsync(_cts.Token))
+            var streams = new List<string>();
+            while (await _channel.Reader.WaitToReadAsync(_cts.Token))
             {
                 if (_forceChannelException)
                 {
@@ -348,8 +357,28 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                     throw new Exception("Simulated test exception in ProcessChannelEventsAsync");
                 }
 
-                _logger.LogTrace($"{Name}: Dequeued {evt.EventNumber}@{evt.StreamId}");
-                await ProcessBufferedEvent(evt);
+                streams.Clear();
+                while (_channel.Reader.TryRead(out var evt))
+                {
+                    _logger.LogTrace($"{Name}: Dequeued {evt.EventNumber}@{evt.StreamId}");
+                    var buffer = _perStreamBuffers.GetOrAdd(evt.StreamId, _ => new SortedDictionary<ulong, BufferedEvent>());
+                    buffer[evt.EventNumber.ToUInt64()] = evt;
+                    if (!streams.Contains(evt.StreamId))
+                        streams.Add(evt.StreamId);
+                }
+
+                var appendedPositions = await Task.WhenAll(streams.Select(DrainStreamBufferAsync));
+
+                Position? maxAppended = null;
+                foreach (var position in appendedPositions)
+                    if (position.HasValue && (maxAppended == null || position.Value > maxAppended.Value))
+                        maxAppended = position;
+
+                if (maxAppended.HasValue && maxAppended.Value > LastPosition)
+                {
+                    LastPosition = maxAppended.Value;
+                    _positionRepository.Set(maxAppended.Value);
+                }
             }
         }
         catch (OperationCanceledException) { }
@@ -360,51 +389,185 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         }
     }
 
-    private async Task ProcessBufferedEvent(BufferedEvent evt)
+    private async Task<Position?> DrainStreamBufferAsync(string streamId)
     {
-        var streamId = evt.StreamId;
-        var eventNum = evt.EventNumber.ToUInt64();
+        if (!_perStreamBuffers.TryGetValue(streamId, out var buffer))
+            return null;
 
-        var buffer = _perStreamBuffers.GetOrAdd(streamId, _ => new SortedDictionary<ulong, BufferedEvent>());
-        buffer[eventNum] = evt;
-
-        ulong expected;
-        if (_lastWrittenPerStream.TryGetValue(streamId, out var lastWritten))
-            expected = (lastWritten.HasValue ? lastWritten.Value + 1 : 0);
-        else
-            expected = 0;
+        var tracked = _lastWrittenPerStream.TryGetValue(streamId, out var lastWritten);
+        var expected = tracked && lastWritten.HasValue ? lastWritten.Value + 1 : 0;
 
         _logger.LogTrace($"{Name}: LastWritten={(lastWritten.HasValue ? lastWritten.Value.ToString() : "null")}, Expected={expected}, BufferCount={buffer.Count}");
         _logger.LogTrace($"{Name}: Buffer keys: {string.Join(",", buffer.Keys)}");
 
         foreach (var stale in buffer.Keys.Where(k => k < expected).ToList())
             buffer.Remove(stale);
-        
-        if (!buffer.ContainsKey(expected))
+
+        if (buffer.Count > 0 && !buffer.ContainsKey(expected))
             _logger.LogDebug($"{Name}: Missing expected event {expected}@{streamId}, can't append");
 
-        while (buffer.TryGetValue(expected, out var next))
+        var run = new List<BufferedEvent>();
+        for (var next = expected; buffer.TryGetValue(next, out var evt); next++)
+            run.Add(evt);
+
+        Position? maxAppended = null;
+        if (run.Count > 0)
         {
-            await AppendEventAsync(next);
-            _lastWrittenPerStream[streamId] = expected;
-            _flusherForStreamPositions.Update(streamId, expected);
-            if (expected == 0)
-                await _flusherForStreamPositions.FlushAsync();
-            buffer.Remove(expected);
-            expected++;
+            await _appendConcurrency.WaitAsync(_cts.Token);
+            try
+            {
+                if (tracked && !IsAdjustedStream(streamId))
+                    maxAppended = await AppendRunAsync(streamId, run, lastWritten);
+                else
+                    await AppendRunEventByEventAsync(streamId, run);
+            }
+            finally
+            {
+                _appendConcurrency.Release();
+            }
+
+            foreach (var evt in run)
+                buffer.Remove(evt.EventNumber.ToUInt64());
         }
 
         if (buffer.Count == 0)
             _perStreamBuffers.TryRemove(streamId, out _);
+
+        return maxAppended;
+    }
+
+    private async Task AppendRunEventByEventAsync(string streamId, IEnumerable<BufferedEvent> run)
+    {
+        foreach (var evt in run)
+        {
+            await AppendEventAsync(evt);
+            var eventNumber = evt.EventNumber.ToUInt64();
+            _lastWrittenPerStream[streamId] = eventNumber;
+            _flusherForStreamPositions.Update(streamId, eventNumber);
+            if (eventNumber == 0)
+                await _flusherForStreamPositions.FlushAsync();
+        }
+    }
+
+    private async Task<Position?> AppendRunAsync(string streamId, List<BufferedEvent> run, ulong? lastWritten)
+    {
+        if (_destinationConnection == null)
+            throw new InvalidOperationException("Destination connection is not initialized");
+
+        Position? maxAppended = null;
+        var repaired = false;
+        var start = 0;
+        while (start < run.Count)
+        {
+            var chunk = new List<BufferedEvent>();
+            long chunkBytes = 0;
+            while (start + chunk.Count < run.Count && chunk.Count < MaxAppendBatchSize)
+            {
+                var evt = run[start + chunk.Count];
+                chunkBytes += evt.EventData.Data.Length + evt.EventData.Metadata.Length;
+                if (chunk.Count > 0 && chunkBytes > MaxAppendBatchBytes)
+                    break;
+                chunk.Add(evt);
+            }
+
+            var expectedRevision = lastWritten.HasValue
+                ? StreamState.StreamRevision(lastWritten.Value)
+                : StreamState.NoStream;
+
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await _destinationConnection.AppendToStreamAsync(streamId, expectedRevision,
+                    chunk.Select(e => e.EventData));
+            }
+            catch (WrongExpectedVersionException)
+            {
+                if (!repaired)
+                {
+                    repaired = true;
+                    var lastInDest = await GetLastEventFromAStreamAsync(streamId);
+                    var actual = lastInDest?.OriginalEventNumber.ToUInt64();
+                    _logger.LogWarning($"{Name}: Tracked position for {streamId} was stale (expected last {lastWritten?.ToString() ?? "none"}, destination has {actual?.ToString() ?? "none"}); repaired and retrying");
+                    _lastWrittenPerStream[streamId] = actual;
+                    if (actual.HasValue)
+                        _flusherForStreamPositions.Update(streamId, actual.Value);
+                    lastWritten = actual;
+                    while (start < run.Count && actual.HasValue && run[start].EventNumber.ToUInt64() <= actual.Value)
+                        start++;
+                    continue;
+                }
+
+                _logger.LogWarning($"{Name}: Batch append conflict on {streamId} persists after repair; retrying event by event");
+                await AppendRunEventByEventAsync(streamId, run.Skip(start));
+                return maxAppended;
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("eventStreamId"))
+            {
+                _logger.LogWarning(ex, $"{Name}: Batch append rejected for {streamId}; retrying event by event");
+                await AppendRunEventByEventAsync(streamId, run.Skip(start));
+                return maxAppended;
+            }
+            sw.Stop();
+
+            lock (_latencySamples)
+            {
+                _latencySamples.Add(sw.ElapsedMilliseconds);
+                if (_latencySamples.Count > 100) _latencySamples.RemoveAt(0);
+            }
+
+            var lastEvent = chunk[^1];
+            maxAppended = lastEvent.OriginalPosition;
+
+            var lastNumber = lastEvent.EventNumber.ToUInt64();
+            _lastWrittenPerStream[streamId] = lastNumber;
+            _flusherForStreamPositions.Update(streamId, lastNumber);
+            if (!lastWritten.HasValue)
+                await _flusherForStreamPositions.FlushAsync();
+
+            Interlocked.Add(ref _replicatedSinceLastStats, chunk.Count);
+            Interlocked.Add(ref _replicatedTotal, chunk.Count);
+
+            lastWritten = lastNumber;
+            start += chunk.Count;
+        }
+
+        return maxAppended;
+    }
+
+    private bool IsAdjustedStream(string streamId)
+    {
+        lock (_adjustedLock)
+            return _adjustedStartStreams.Contains(streamId);
+    }
+
+    private async Task SaveAdjustedStreamsAsync()
+    {
+        HashSet<string> snapshot;
+        lock (_adjustedLock)
+            snapshot = [.._adjustedStartStreams];
+
+        await _adjustedSaveLock.WaitAsync();
+        try
+        {
+            await _adjustedStreamRepository.SaveAsync(snapshot);
+        }
+        finally
+        {
+            _adjustedSaveLock.Release();
+        }
     }
 
     private async Task AddToAdjustedStreams(string streamId)
     {
-        var updated = _adjustedStartStreams.Add(streamId) ||
+        bool updated;
+        lock (_adjustedLock)
+        {
+            updated = _adjustedStartStreams.Add(streamId) ||
                       !streamId.StartsWith("$$") && _adjustedStartStreams.Add("$$" + streamId);
+        }
 
         if (updated)
-            await _adjustedStreamRepository.SaveAsync(_adjustedStartStreams);
+            await SaveAdjustedStreamsAsync();
     }
 
     private async Task SubscribeMeGrpc(CancellationToken ctsToken)
@@ -424,15 +587,6 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                     switch (message)
                     {
                         case StreamMessage.Event(var evnt):
-                            var currentBuffer = _channel.Reader.Count;
-                            var threshold = _currentBackpressureThreshold;
-
-                            if (currentBuffer >= _bufferSize * threshold)
-                            {
-                                _logger.LogDebug($"{Name}: Backpressure active. Buffer={currentBuffer}/{_bufferSize}, Threshold={threshold:P0}");
-                                await Task.Delay(100, ctsToken);
-                            }
-
                             await HandleEventAsync(evnt);
                             if (evnt.OriginalPosition.HasValue)
                                 ScanPosition = evnt.OriginalPosition.Value;
@@ -527,6 +681,13 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             return;
         }
 
+        if (eventNumber == 0 && !IsAdjustedStream(streamId))
+        {
+            _lastWrittenPerStream[streamId] = null;
+            _logger.LogDebug("{Name}: Tracking new stream {StreamId} optimistically from event 0", Name, streamId);
+            return;
+        }
+
         var lastInDest = await GetLastEventFromAStreamAsync(streamId);
         if (lastInDest != null)
         {
@@ -541,7 +702,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             _lastWrittenPerStream[streamId] = null; // Mark as ready but not written yet
             _logger.LogDebug("{Name}: Initialized empty stream {StreamId}, ready to replicate event 0", Name, streamId);
         }
-        else if (_adjustedStartStreams.Contains(streamId))
+        else if (IsAdjustedStream(streamId))
         {
             _lastWrittenPerStream[streamId] = eventNumber - 1;
             _flusherForStreamPositions.Update(streamId, eventNumber - 1);
@@ -581,7 +742,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                 {
                     expectedRevision = StreamState.StreamRevision(lastEventNumber);
                 }
-                else if (_adjustedStartStreams.Contains(evt.StreamId))
+                else if (IsAdjustedStream(evt.StreamId))
                 {
                     _logger.LogWarning($"{Name}: Skipping gap in adjusted stream {evt.StreamId}. Got {eventNumber}, expected {lastEventNumber + 1}");
                     await UpdateStreamTrackingAsync(evt);
@@ -598,7 +759,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                     throw new InvalidOperationException($"Out-of-order event detected in {evt.StreamId}. Expected {lastEventNumber + 1}, got {eventNumber}.");
                 }
             }
-            else if (_adjustedStartStreams.Contains(evt.StreamId))
+            else if (IsAdjustedStream(evt.StreamId))
             {
                 _logger.LogInformation($"{Name}: Stream {evt.StreamId} is empty but adjusted start is enabled — using StreamState.NoStream for event {eventNumber}");
                 expectedRevision = StreamState.NoStream;
@@ -612,7 +773,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                 }
                 else
                 {
-                    var isAdjusted = _adjustedStartStreams.Contains(evt.StreamId);
+                    var isAdjusted = IsAdjustedStream(evt.StreamId);
                     _lastWrittenPerStream.TryGetValue(evt.StreamId, out var lastWritten);
 
                     _logger.LogWarning($"{Name}: Debug — about to append event {eventNumber}@{evt.StreamId}, adjusted={isAdjusted}, lastWritten={lastWritten}");
@@ -627,7 +788,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             {
                 expectedRevision = StreamState.NoStream;
             }
-            else if (_adjustedStartStreams.Contains(evt.StreamId))
+            else if (IsAdjustedStream(evt.StreamId))
             {
                 _logger.LogDebug($"{Name}: Stream {evt.StreamId} missing but start adjusted — using StreamState.NoStream for event {eventNumber}");
                 expectedRevision = StreamState.NoStream;
@@ -739,8 +900,11 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         Interlocked.Increment(ref _replicatedSinceLastStats);
         Interlocked.Increment(ref _replicatedTotal);
 
-        if (_adjustedStartStreams.Remove(streamId))
-            await _adjustedStreamRepository.SaveAsync(_adjustedStartStreams);
+        bool removed;
+        lock (_adjustedLock)
+            removed = _adjustedStartStreams.Remove(streamId);
+        if (removed)
+            await SaveAdjustedStreamsAsync();
     }
 
     private async Task<ResolvedEvent?> GetLastEventFromAStreamAsync(string streamId)
