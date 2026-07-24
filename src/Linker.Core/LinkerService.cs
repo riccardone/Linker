@@ -18,8 +18,15 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     private readonly IFilterService? _filterService;
     private readonly Settings _settings;
     private Position _lastPosition;
+    private readonly Lock _positionLock = new();
     private Position _originCurrentEnd = Position.Start;
     public string Name { get; }
+
+    private Position LastPosition
+    {
+        get { lock (_positionLock) return _lastPosition; }
+        set { lock (_positionLock) _lastPosition = value; }
+    }
 
     private readonly ILinkerConnectionBuilder _originConnectionBuilder;
     private readonly ILinkerConnectionBuilder _destinationConnectionBuilder;
@@ -51,6 +58,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     public const int MaxAllowedBuffer = 1000;
     public const int MinAllowedBuffer = 1;
     private const int StatsIntervalMs = 3000;
+    private static readonly TimeSpan ResubscribeDelay = TimeSpan.FromSeconds(5);
 
     private readonly ConcurrentDictionary<string, SortedDictionary<ulong, BufferedEvent>> _perStreamBuffers = new();
     private readonly ConcurrentDictionary<string, ulong?> _lastWrittenPerStream = new();
@@ -135,6 +143,9 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         foreach (var evt in buffered)
             await _channel.Writer.WriteAsync(evt);
 
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
+
         StartWorkerTasks();
     }
 
@@ -155,8 +166,9 @@ public class LinkerService : ILinkerService, IAsyncDisposable
 
         _cts = new CancellationTokenSource();
 
-        if (!_positionRepository.TryGet(out _lastPosition))
-            _lastPosition = Position.Start;
+        if (!_positionRepository.TryGet(out var storedPosition))
+            storedPosition = Position.Start;
+        LastPosition = storedPosition;
 
         _adjustedStartStreams.Clear();
         var loaded = await _adjustedStreamRepository.LoadAsync();
@@ -346,6 +358,9 @@ public class LinkerService : ILinkerService, IAsyncDisposable
 
         _logger.LogTrace($"{Name}: LastWritten={(lastWritten.HasValue ? lastWritten.Value.ToString() : "null")}, Expected={expected}, BufferCount={buffer.Count}");
         _logger.LogTrace($"{Name}: Buffer keys: {string.Join(",", buffer.Keys)}");
+
+        foreach (var stale in buffer.Keys.Where(k => k < expected).ToList())
+            buffer.Remove(stale);
         
         if (!buffer.ContainsKey(expected))
             _logger.LogDebug($"{Name}: Missing expected event {expected}@{streamId}, can't append");
@@ -378,21 +393,41 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     {
         if (_originConnection == null)
             throw new Exception("Origin connection is not initialized");
-        await using var subscription = _originConnection.SubscribeToAll(start: FromAll.After(_lastPosition), cancellationToken: ctsToken,
-            resolveLinkTos: _settings.ResolveLinkTos, filterOptions: new SubscriptionFilterOptions(EventTypeFilter.RegularExpression(@"^(\$metadata|[^\$].*)")));
-        await foreach (var message in subscription.Messages.WithCancellation(ctsToken))
+
+        while (!ctsToken.IsCancellationRequested)
         {
-            var currentBuffer = _channel.Reader.Count;
-            var threshold = _currentBackpressureThreshold;
-
-            if (currentBuffer >= _bufferSize * threshold)
+            try
             {
-                _logger.LogDebug($"{Name}: Backpressure active. Buffer={currentBuffer}/{_bufferSize}, Threshold={threshold:P0}");
-                await Task.Delay(100, ctsToken);
-            }
+                await using var subscription = _originConnection.SubscribeToAll(start: FromAll.After(LastPosition), cancellationToken: ctsToken,
+                    resolveLinkTos: _settings.ResolveLinkTos, filterOptions: new SubscriptionFilterOptions(EventTypeFilter.RegularExpression(@"^(\$metadata|[^\$].*)")));
+                await foreach (var message in subscription.Messages.WithCancellation(ctsToken))
+                {
+                    var currentBuffer = _channel.Reader.Count;
+                    var threshold = _currentBackpressureThreshold;
 
-            if (message is StreamMessage.Event(var evnt))
-                await HandleEventAsync(evnt);
+                    if (currentBuffer >= _bufferSize * threshold)
+                    {
+                        _logger.LogDebug($"{Name}: Backpressure active. Buffer={currentBuffer}/{_bufferSize}, Threshold={threshold:P0}");
+                        await Task.Delay(100, ctsToken);
+                    }
+
+                    if (message is StreamMessage.Event(var evnt))
+                        await HandleEventAsync(evnt);
+                }
+
+                _logger.LogWarning("{Name}: Subscription completed unexpectedly at position {Position}; resubscribing in {Delay}s", Name, LastPosition, ResubscribeDelay.TotalSeconds);
+                await Task.Delay(ResubscribeDelay, ctsToken);
+            }
+            catch (OperationCanceledException) when (ctsToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "{Name}: Subscription dropped at position {Position}; resubscribing in {Delay}s", Name, LastPosition, ResubscribeDelay.TotalSeconds);
+                try { await Task.Delay(ResubscribeDelay, ctsToken); }
+                catch (OperationCanceledException) { break; }
+            }
         }
     }
 
@@ -416,7 +451,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         if (!_replicaHelper.TryProcessMetadata(evt.Event.EventStreamId, evt.Event.EventNumber, evt.Event.Created,
                 _originConnectionBuilder.ConnectionName, metadata, out var enrichedMetadata))
         {
-            _logger.LogDebug($"{Name}: Updated global last position to {_lastPosition}");
+            _logger.LogDebug($"{Name}: Updated global last position to {LastPosition}");
             return;
         }
 
@@ -581,8 +616,8 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         try
         {
             await _destinationConnection.AppendToStreamAsync(evt.StreamId, expectedRevision, [evt.EventData]);
-            _lastPosition = evt.OriginalPosition;
-            _positionRepository.Set(_lastPosition);
+            LastPosition = evt.OriginalPosition;
+            _positionRepository.Set(evt.OriginalPosition);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("eventStreamId"))
         {
@@ -720,8 +755,8 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             });
             Interlocked.Increment(ref _replicatedSinceLastStats);
             Interlocked.Increment(ref _replicatedTotal);
-            _lastPosition = evt.OriginalPosition;
-            _positionRepository.Set(_lastPosition);
+            LastPosition = evt.OriginalPosition;
+            _positionRepository.Set(evt.OriginalPosition);
             return true;
         }
         catch (Exception innerEx)
@@ -745,10 +780,11 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         }
 
         double progressPercent = 0;
-        if (_originCurrentEnd > Position.Start && _lastPosition > Position.Start)
+        var lastPosition = LastPosition;
+        if (_originCurrentEnd > Position.Start && lastPosition > Position.Start)
         {
             var origin = _originCurrentEnd.CommitPosition + _originCurrentEnd.PreparePosition;
-            var current = _lastPosition.CommitPosition + _lastPosition.PreparePosition;
+            var current = lastPosition.CommitPosition + lastPosition.PreparePosition;
             if (origin > 0)
                 progressPercent = Math.Min(100, (double)current / origin * 100);
         }
@@ -818,7 +854,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         ["from"] = _originConnectionBuilder.ConnectionName,
         ["to"] = _destinationConnectionBuilder.ConnectionName,
         ["isRunning"] = _started,
-        ["lastPosition"] = _lastPosition,
+        ["lastPosition"] = LastPosition,
         ["bufferedEvents"] = _channel.Reader.Count,
         ["replicatedTotal"] = Interlocked.Read(ref _replicatedTotal)
     };
