@@ -18,14 +18,27 @@ public class LinkerService : ILinkerService, IAsyncDisposable
     private readonly IFilterService? _filterService;
     private readonly Settings _settings;
     private Position _lastPosition;
+    private Position _scanPosition;
     private readonly Lock _positionLock = new();
     private Position _originCurrentEnd = Position.Start;
+    private volatile bool _isLive;
+    private ulong _previousScanCommit;
+    private DateTime _previousScanSampleAt;
+    private double _scanRatePerSecond;
+    private int _stalledIntervals;
+    private int _originEndRefreshCounter;
     public string Name { get; }
 
     private Position LastPosition
     {
         get { lock (_positionLock) return _lastPosition; }
         set { lock (_positionLock) _lastPosition = value; }
+    }
+
+    private Position ScanPosition
+    {
+        get { lock (_positionLock) return _scanPosition; }
+        set { lock (_positionLock) _scanPosition = value; }
     }
 
     private readonly ILinkerConnectionBuilder _originConnectionBuilder;
@@ -169,6 +182,11 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         if (!_positionRepository.TryGet(out var storedPosition))
             storedPosition = Position.Start;
         LastPosition = storedPosition;
+        ScanPosition = storedPosition;
+        _isLive = false;
+        _previousScanSampleAt = default;
+        _scanRatePerSecond = 0;
+        _stalledIntervals = 0;
 
         _adjustedStartStreams.Clear();
         var loaded = await _adjustedStreamRepository.LoadAsync();
@@ -398,21 +416,39 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         {
             try
             {
+                _isLive = false;
                 await using var subscription = _originConnection.SubscribeToAll(start: FromAll.After(LastPosition), cancellationToken: ctsToken,
                     resolveLinkTos: _settings.ResolveLinkTos, filterOptions: new SubscriptionFilterOptions(EventTypeFilter.RegularExpression(@"^(\$metadata|[^\$].*)")));
                 await foreach (var message in subscription.Messages.WithCancellation(ctsToken))
                 {
-                    var currentBuffer = _channel.Reader.Count;
-                    var threshold = _currentBackpressureThreshold;
-
-                    if (currentBuffer >= _bufferSize * threshold)
+                    switch (message)
                     {
-                        _logger.LogDebug($"{Name}: Backpressure active. Buffer={currentBuffer}/{_bufferSize}, Threshold={threshold:P0}");
-                        await Task.Delay(100, ctsToken);
-                    }
+                        case StreamMessage.Event(var evnt):
+                            var currentBuffer = _channel.Reader.Count;
+                            var threshold = _currentBackpressureThreshold;
 
-                    if (message is StreamMessage.Event(var evnt))
-                        await HandleEventAsync(evnt);
+                            if (currentBuffer >= _bufferSize * threshold)
+                            {
+                                _logger.LogDebug($"{Name}: Backpressure active. Buffer={currentBuffer}/{_bufferSize}, Threshold={threshold:P0}");
+                                await Task.Delay(100, ctsToken);
+                            }
+
+                            await HandleEventAsync(evnt);
+                            if (evnt.OriginalPosition.HasValue)
+                                ScanPosition = evnt.OriginalPosition.Value;
+                            break;
+                        case StreamMessage.AllStreamCheckpointReached(var checkpoint):
+                            ScanPosition = checkpoint;
+                            break;
+                        case StreamMessage.CaughtUp:
+                            _isLive = true;
+                            _logger.LogInformation("{Name}: Caught up with origin — subscription is now live", Name);
+                            break;
+                        case StreamMessage.FellBehind:
+                            _isLive = false;
+                            _logger.LogInformation("{Name}: Fell behind origin — catching up again", Name);
+                            break;
+                    }
                 }
 
                 _logger.LogWarning("{Name}: Subscription completed unexpectedly at position {Position}; resubscribing in {Delay}s", Name, LastPosition, ResubscribeDelay.TotalSeconds);
@@ -779,16 +815,6 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             avgLatency = _latencySamples.Count > 0 ? (long)_latencySamples.Average() : 0;
         }
 
-        double progressPercent = 0;
-        var lastPosition = LastPosition;
-        if (_originCurrentEnd > Position.Start && lastPosition > Position.Start)
-        {
-            var origin = _originCurrentEnd.CommitPosition + _originCurrentEnd.PreparePosition;
-            var current = lastPosition.CommitPosition + lastPosition.PreparePosition;
-            if (origin > 0)
-                progressPercent = Math.Min(100, (double)current / origin * 100);
-        }
-
         lock (_adaptiveLock)
         {
             _replicationSamples.Add(replicatedThisInterval);
@@ -805,40 +831,89 @@ public class LinkerService : ILinkerService, IAsyncDisposable
 
                 if (average == 0 && previous == 0)
                 {
-                    _logger.LogInformation($"{Name} adaptive tuning skipped: no replication activity. Current BufferSize={_bufferSize}");
-                    return;
-                }
-
-                var percentChange = previous == 0 ? 1 : (average - previous) / previous;
-                var proposed = _bufferSize;
-
-                if (_settings.AutomaticTuning)
-                {
-                    var delta = Math.Max(1, (int)Math.Round(_bufferSize * _allowedIncreaseOrDecreaseAmount));
-
-                    if (percentChange >= _significantIncreaseToTriggerIncrease)
-                    {
-                        // Steady or improving: increase buffer
-                        proposed = Math.Min(MaxAllowedBuffer, _bufferSize + delta);
-                    }
-                    else if (percentChange < _significantRegressionToTriggerDecrease)
-                    {
-                        // Significant regression: decrease buffer
-                        proposed = Math.Max(MinAllowedBuffer, _bufferSize - delta);
-                    }
-
-                    if (proposed != _bufferSize)
-                        _ = ResizeChannelAsync(proposed);
-
-                    _logger.LogInformation($"{Name} adaptive tuning: prevAvg={previous:F1}, currentAvg={average:F1}, proposed bufferSize={proposed}, change={percentChange:P1}");
+                    _logger.LogDebug($"{Name} adaptive tuning skipped: no replication activity. Current BufferSize={_bufferSize}");
                 }
                 else
-                    _logger.LogInformation($"{Name} prevAvg={previous:F1}, currentAvg={average:F1}, bufferSize={proposed}, change={percentChange:P1}");
+                {
+                    var percentChange = previous == 0 ? 1 : (average - previous) / previous;
+                    var proposed = _bufferSize;
+
+                    if (_settings.AutomaticTuning)
+                    {
+                        var delta = Math.Max(1, (int)Math.Round(_bufferSize * _allowedIncreaseOrDecreaseAmount));
+
+                        if (percentChange >= _significantIncreaseToTriggerIncrease)
+                        {
+                            // Steady or improving: increase buffer
+                            proposed = Math.Min(MaxAllowedBuffer, _bufferSize + delta);
+                        }
+                        else if (percentChange < _significantRegressionToTriggerDecrease)
+                        {
+                            // Significant regression: decrease buffer
+                            proposed = Math.Max(MinAllowedBuffer, _bufferSize - delta);
+                        }
+
+                        if (proposed != _bufferSize)
+                        {
+                            _ = ResizeChannelAsync(proposed);
+                            _logger.LogInformation($"{Name} adaptive tuning: prevAvg={previous:F1}, currentAvg={average:F1}, proposed bufferSize={proposed}, change={percentChange:P1}");
+                        }
+                        else
+                            _logger.LogDebug($"{Name} adaptive tuning: prevAvg={previous:F1}, currentAvg={average:F1}, proposed bufferSize={proposed}, change={percentChange:P1}");
+                    }
+                    else
+                        _logger.LogDebug($"{Name} prevAvg={previous:F1}, currentAvg={average:F1}, bufferSize={proposed}, change={percentChange:P1}");
+                }
             }
         }
 
+        var status = BuildProgressStatus();
+
         _logger.LogInformation(
-            $"{Name} stats: replicated {replicatedThisInterval} events, total: {totalReplicated}, buffer: {bufferSize}/{_bufferSize} ({bufferRatio:P0}), latency: {avgLatency}ms, progress: {progressPercent:F1}%");
+            $"{Name} stats: {status}, replicated {replicatedThisInterval} events (total {totalReplicated}), buffer: {bufferSize}/{_bufferSize} ({bufferRatio:P0}), latency: {avgLatency}ms");
+
+        if (++_originEndRefreshCounter >= 10)
+        {
+            _originEndRefreshCounter = 0;
+            _ = UpdateOriginCurrentEndAsync();
+        }
+    }
+
+    private string BuildProgressStatus()
+    {
+        if (_isLive)
+            return "live";
+
+        var scanCommit = ScanPosition.CommitPosition;
+        var originEndCommit = _originCurrentEnd.CommitPosition;
+
+        double scanPercent = 0;
+        if (originEndCommit > 0)
+            scanPercent = Math.Min(100, (double)scanCommit / originEndCommit * 100);
+
+        var now = DateTime.UtcNow;
+        if (_previousScanSampleAt != default && now > _previousScanSampleAt && scanCommit >= _previousScanCommit)
+        {
+            var rate = (scanCommit - _previousScanCommit) / (now - _previousScanSampleAt).TotalSeconds;
+            _scanRatePerSecond = _scanRatePerSecond == 0 ? rate : _scanRatePerSecond * 0.7 + rate * 0.3;
+            _stalledIntervals = scanCommit == _previousScanCommit ? _stalledIntervals + 1 : 0;
+        }
+        _previousScanCommit = scanCommit;
+        _previousScanSampleAt = now;
+
+        var status = $"catching up {scanPercent:F1}%";
+        if (_stalledIntervals >= 3)
+            return status + $", STALLED (no scan progress for {_stalledIntervals * StatsIntervalMs / 1000}s)";
+
+        if (_scanRatePerSecond > 0 && originEndCommit > scanCommit)
+        {
+            var eta = TimeSpan.FromSeconds((originEndCommit - scanCommit) / _scanRatePerSecond);
+            status += eta.TotalHours >= 1
+                ? $", ETA {(int)eta.TotalHours}h{eta.Minutes:D2}m"
+                : $", ETA {eta.Minutes}m{eta.Seconds:D2}s";
+        }
+
+        return status;
     }
 
     private async Task RestartServiceAsync()
@@ -854,7 +929,10 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         ["from"] = _originConnectionBuilder.ConnectionName,
         ["to"] = _destinationConnectionBuilder.ConnectionName,
         ["isRunning"] = _started,
+        ["isLive"] = _isLive,
         ["lastPosition"] = LastPosition,
+        ["scanPosition"] = ScanPosition,
+        ["originEnd"] = _originCurrentEnd,
         ["bufferedEvents"] = _channel.Reader.Count,
         ["replicatedTotal"] = Interlocked.Read(ref _replicatedTotal)
     };
