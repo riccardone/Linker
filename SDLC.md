@@ -1,7 +1,7 @@
 # How Linker is built and released
 
-> Written 2026-11-26, adapted from the Sudio lifecycle (`Sudio.Api/SDLC.md`). Linker differs from Sudio in three ways
-> that shape everything below. It is a public Apache-2.0 repository that outside contributors send pull requests to.
+> Three things about Linker shape everything below. It is a public Apache-2.0 repository that outside contributors
+> send pull requests to.
 > What it ships is versioned (a NuGet package, a Docker image and binaries that other people pin), so a release is a
 > tag, not a push. And it has no production of its own, only other people's clusters, so the proof before a push is the
 > test suite run against two real KurrentDB nodes. This is the one place the lifecycle is written down;
@@ -12,8 +12,7 @@
 
 - Requests arrive as GitHub issues, as pull requests from contributors, or from the owner. Ambiguity is resolved by
   reading the code, the logs a reporter attached and the stored events, and by reproducing the case on the testbed
-  (§3), never by guessing. A defect is answered only after its cause is established (the v1.2.0 NuGet 403: the owner of
-  the `Linker.Core` id was read from nuget.org before a line changed).
+  (§3), never by guessing. A defect is answered only after its cause is established.
 - Every open task, bug and owner decision is an issue on `riccardone/Linker`, checked against the code, git and the
   registries before it is filed or closed. It carries the evidence (file:line, commit, log line), what decides it and a
   "Done when" list. Open work a code comment would name (a `TODO`) is filed as an issue instead; no plan, task list or
@@ -42,9 +41,10 @@
   settings `appsettings.json` accepts change only as semantic versioning allows (§4): within a major version a setting
   is never renamed, removed or given a new default, and a public type or member is never removed.
 - **Credentials are never logged**: certificates, private keys and connection strings with passwords.
-- **Tests fake what the code owns** (`IPositionRepository`, `IStreamPositionFlusher`, `IFilterService`,
-  `IAdjustedStreamRepository`). Behaviour that needs KurrentDB itself is proven by an integration test against real
-  nodes (§3), never by mocking the client.
+- **A unit test fakes what `LinkerService` takes through its constructor** (`IFilterService`,
+  `IAdjustedStreamRepository`, and `IPositionRepository` from the `EventStore.Tools.PositionRepository.Gprc` package),
+  never the KurrentDB client. Behaviour that needs KurrentDB itself is proven by an integration test against real
+  nodes (§3).
 
 ## 3. Build: tests first
 
@@ -79,8 +79,8 @@
   the Claude Code attribution line. `main` is protected against deletion and force-pushes (the ruleset on `main`).
 - **Before the push, two gates, in this order; nothing is pushed while either is open.**
   1. **Review**: `/workspace-review C:\code\opensource\Linker`, the review of everything `main` holds that origin does
-     not and of every uncommitted change. A reviewer that has not seen the conversation (the skill pins Sonnet 5.5 at
-     high effort) reads the change against section 2 and the instructions file. The author's session verifies each
+     not and of every uncommitted change. A reviewer that has not seen the conversation (the skill pins its model
+     and effort) reads the change against section 2 and the instructions file. The author's session verifies each
      finding and either fixes it on `main` with a test or answers why it stands (on the issue, when there is one);
      nothing is dropped silently. Work changed after the review is reviewed again, for what is new.
   2. **The testbed** (§3): the whole suite green with the integration tests enabled, against the build being pushed.
@@ -92,14 +92,13 @@
 - **A release is a tag**, cut when `main` holds what should ship and CI is green on that commit:
   - The version follows semantic versioning against the §2 contract: patch for fixes, minor for features and
     compatible changes of behaviour, major for a breaking change to the public API or the settings.
-  - `git tag vX.Y.Z <sha>` then `git push origin refs/tags/vX.Y.Z` (or `tag-and-push.sh`, which prompts for the
-    version).
+  - `git tag vX.Y.Z <sha>` then `git push origin refs/tags/vX.Y.Z`. `tag-and-push.sh` does the same for the commit
+    checked out (it prompts for the version and tags `HEAD`), and checks neither the branch nor CI.
   - The tag runs `.github/workflows/release.yml`: build, pack `Linker.KurrentDB` with the tag's version, NuGet login
     through trusted publishing (no stored key), push to NuGet.org and GitHub Packages, self-contained zips for
-    linux-x64, win-x64 and osx-arm64, the Docker image `linker:<version>` and `latest`, and the GitHub release with the
+    linux-x64, win-x64 and osx-arm64, the Docker image `riccardone/linker:<version>` and `latest`, and the GitHub release with the
     commits since the previous tag.
-- **Tags are never moved or deleted once pushed.** A broken release is fixed by the next patch version (v1.2.0, whose
-  NuGet push was rejected, was followed by v1.2.1).
+- **Tags are never moved or deleted once pushed.** A broken release is fixed by the next patch version.
 
 ## 5. Verify the release, then close the loop
 
@@ -119,8 +118,8 @@
 - No force-pushes, no moved or deleted tags, no skipped hooks, no push with an unfixed review finding or a red test, no
   release from a red `main`.
 - No feature branches or pull requests for the owner's own work: pull requests are how contributors' work arrives.
-- No long-lived publishing keys: NuGet publishes through trusted publishing. The repository's secrets are the Docker
-  Hub credentials, plus `GITHUB_TOKEN`, which GitHub provides for each run.
+- No long-lived publishing keys: NuGet publishes through trusted publishing. The only secrets the release uses are the
+  Docker Hub credentials and the `GITHUB_TOKEN` GitHub provides for each run; a secret nothing uses is deleted.
 - No staging environment: the testbed is local.
 - No open work kept as a document: a plan, a task list or a TODO is an issue (§1).
 
