@@ -34,7 +34,9 @@
 - **Per-stream order is kept; cross-stream order is not promised.** Streams are drained in parallel, so the
   destination's `$all` order can differ from the origin's.
 - **A conflict is never skipped silently.** With `HandleConflicts` on it goes to the
-  `$conflicts-from-<origin>-to-<destination>` stream; with it off, replication stops and logs why.
+  `$conflicts-from-<origin>-to-<destination>` stream. With it off (or when writing to that stream fails), the drain
+  fails and logs the conflict; the host restarts the link from the checkpoint, which has not passed the event, so the
+  link retries it, about once a second, until the conflict is resolved in the destination.
 - **Loop prevention**: every replicated event carries `$origin`; an event whose origin list includes the destination is
   never written back to it.
 - **The contract is versioned.** The public API of `Linker.Core` (published as the `Linker.KurrentDB` package) and the
