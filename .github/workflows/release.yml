@@ -11,6 +11,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write  # nuget.org trusted publishing exchanges the job's OIDC token for a short-lived API key
 
     steps:
       - name: Checkout repository
@@ -41,10 +42,20 @@ jobs:
       - name: Show packaged files
         run: ls -lh ./nupkgs
 
+      # Trusted publishing: matches the nuget.org policy for riccardone/Linker, workflow release.yml.
+      # The API key it returns is valid for one hour, so it is requested right before the push.
+      - name: NuGet login (trusted publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: riccardone  # nuget.org profile name, not an email address
+
       - name: Push to NuGet.org
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: |
           find ./nupkgs -name "*.nupkg" -exec dotnet nuget push {} \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate \;
 
@@ -96,11 +107,15 @@ jobs:
         id: changelog
         run: |
           REPO_URL="https://github.com/${{ github.repository }}"
+          # The tag being released points at HEAD, so look for the previous tag from HEAD's parent.
+          # With no earlier tag, list the whole history.
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          RANGE=${PREVIOUS_TAG:+$PREVIOUS_TAG..}HEAD
           {
             echo "changelog<<EOF"
             echo "### Changelog"
             echo ""
-            git log --pretty=format:"- \`%s\` ([%h](${REPO_URL}/commit/%H))" $(git describe --tags --abbrev=0)^..HEAD
+            git log --pretty=format:"- \`%s\` ([%h](${REPO_URL}/commit/%H))" "$RANGE"
             echo ""
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
