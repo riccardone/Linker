@@ -419,7 +419,7 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                 if (tracked && !IsAdjustedStream(streamId))
                     maxAppended = await AppendRunAsync(streamId, run, lastWritten);
                 else
-                    await AppendRunEventByEventAsync(streamId, run);
+                    maxAppended = await AppendRunEventByEventAsync(streamId, run);
             }
             finally
             {
@@ -436,8 +436,12 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         return maxAppended;
     }
 
-    private async Task AppendRunEventByEventAsync(string streamId, IEnumerable<BufferedEvent> run)
+    // Returns the position of the last event handled. It is not saved as the checkpoint here:
+    // other streams are draining concurrently, and only once every drain of the cycle has
+    // succeeded is it safe to move the checkpoint past this event (see ProcessChannelEventsAsync).
+    private async Task<Position?> AppendRunEventByEventAsync(string streamId, IEnumerable<BufferedEvent> run)
     {
+        Position? lastHandled = null;
         foreach (var evt in run)
         {
             await AppendEventAsync(evt);
@@ -446,7 +450,10 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             _flusherForStreamPositions.Update(streamId, eventNumber);
             if (eventNumber == 0)
                 await _flusherForStreamPositions.FlushAsync();
+            lastHandled = evt.OriginalPosition;
         }
+
+        return lastHandled;
     }
 
     private async Task<Position?> AppendRunAsync(string streamId, List<BufferedEvent> run, ulong? lastWritten)
@@ -498,14 +505,12 @@ public class LinkerService : ILinkerService, IAsyncDisposable
                 }
 
                 _logger.LogWarning($"{Name}: Batch append conflict on {streamId} persists after repair; retrying event by event");
-                await AppendRunEventByEventAsync(streamId, run.Skip(start));
-                return maxAppended;
+                return await AppendRunEventByEventAsync(streamId, run.Skip(start)) ?? maxAppended;
             }
             catch (InvalidOperationException ex) when (ex.Message.Contains("eventStreamId"))
             {
                 _logger.LogWarning(ex, $"{Name}: Batch append rejected for {streamId}; retrying event by event");
-                await AppendRunEventByEventAsync(streamId, run.Skip(start));
-                return maxAppended;
+                return await AppendRunEventByEventAsync(streamId, run.Skip(start)) ?? maxAppended;
             }
             sw.Stop();
 
@@ -813,8 +818,6 @@ public class LinkerService : ILinkerService, IAsyncDisposable
         try
         {
             await _destinationConnection.AppendToStreamAsync(evt.StreamId, expectedRevision, [evt.EventData]);
-            LastPosition = evt.OriginalPosition;
-            _positionRepository.Set(evt.OriginalPosition);
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("eventStreamId"))
         {
@@ -955,8 +958,6 @@ public class LinkerService : ILinkerService, IAsyncDisposable
             });
             Interlocked.Increment(ref _replicatedSinceLastStats);
             Interlocked.Increment(ref _replicatedTotal);
-            LastPosition = evt.OriginalPosition;
-            _positionRepository.Set(evt.OriginalPosition);
             return true;
         }
         catch (Exception innerEx)
