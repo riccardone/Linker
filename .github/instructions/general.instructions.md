@@ -6,6 +6,9 @@ Linker is a cross-cluster replication tool for **KurrentDb** (formerly EventStor
 
 Repository: <https://github.com/riccardone/Linker>
 
+How changes are built, reviewed and released (intake, design rules, the testbed, the review gate, versioning and
+releases): [`SDLC.md`](../../SDLC.md).
+
 ---
 
 ## Solution structure
