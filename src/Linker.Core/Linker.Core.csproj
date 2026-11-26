@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
-    <PackageId></PackageId>
+    <PackageId>Linker.KurrentDB</PackageId>
     <Title>Data Replication for KurrentDb</Title>
     <Description>Replicate data between KurrentDb (former EventStore) instances</Description>
     <Copyright>@2025 Riccardo Di Nuzzo</Copyright>
@@ -14,8 +14,9 @@
     <RepositoryUrl>https://github.com/riccardone/Linker</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>KurrentDb; EventSourcing; Replication</PackageTags>
-    <PackageReleaseNotes>fix last save global position
-project renaming</PackageReleaseNotes>
+    <PackageReleaseNotes>Published as Linker.KurrentDB (the Linker.Core id on nuget.org belongs to another owner); the namespace is still Linker.Core.
+Batched, parallel appends during catch-up; resubscribes when the $all subscription drops.
+The replication checkpoint is saved only once every stream in a drain cycle has been written.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

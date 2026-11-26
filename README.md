@@ -16,7 +16,7 @@ More background: [Cross Data Center Replication with Linker](http://www.dinuzzo.
 |--------|------|
 | Download a release | [Latest release](https://github.com/riccardone/Linker/releases) |
 | Docker image | [riccardone/linker](https://hub.docker.com/r/riccardone/linker) |
-| NuGet package (programmatic use) | `Linker.Core` on NuGet |
+| NuGet package (programmatic use) | [Linker.KurrentDB](https://www.nuget.org/packages/Linker.KurrentDB) |
 
 ---
 
@@ -79,7 +79,7 @@ Because the app is built on `Microsoft.Extensions.Configuration`, every setting 
 
 ### 3. NuGet package (programmatic)
 
-Reference the `Linker.Core` NuGet package and build a `LinkerService` directly:
+Reference the [`Linker.KurrentDB`](https://www.nuget.org/packages/Linker.KurrentDB) NuGet package (its types are in the `Linker.Core` namespace) and build a `LinkerService` directly:
 
 ```csharp
 var origin = new LinkerConnectionBuilder(
