@@ -15,7 +15,7 @@ The solution lives under `src/` and contains three projects:
 | Project | Type | Description |
 |---------|------|-------------|
 | `Linker` | Console app (exe) | Host process. Uses `Microsoft.Extensions.Hosting` for configuration, logging and DI. Entry point is `Program.cs` → `ReplicaApp.RunAsync()`. |
-| `Linker.Core` | Class library (NuGet package) | All replication logic. Published as a NuGet package so consumers can embed Linker programmatically. |
+| `Linker.Core` | Class library (NuGet package) | All replication logic. Published to NuGet as `Linker.KurrentDB` (the `Linker.Core` id on nuget.org belongs to another owner) so consumers can embed Linker programmatically. |
 | `Tests` | Test project (NUnit + Moq) | Unit tests for filter logic and linker service behaviour. |
 
 All projects target **.NET 10** (`net10.0`).

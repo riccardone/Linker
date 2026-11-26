@@ -40,7 +40,7 @@ jobs:
           dotnet pack src/Linker.Core/Linker.Core.csproj -c Release --no-build --output ./nupkgs/linker /p:PackageVersion=$VERSION
 
       - name: Show packaged files
-        run: ls -lh ./nupkgs
+        run: ls -lhR ./nupkgs
 
       # Trusted publishing: matches the nuget.org policy for riccardone/Linker, workflow release.yml.
       # The API key it returns is valid for one hour, so it is requested right before the push.
@@ -53,21 +53,33 @@ jobs:
       - name: Push to NuGet.org
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        # A loop, not find -exec: find ignores the exit code of what it runs, which hid every
+        # rejected push. The step's shell stops at the first failing command.
         run: |
-          find ./nupkgs -name "*.nupkg" -exec dotnet nuget push {} \
-            --api-key "$NUGET_API_KEY" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate \;
+          shopt -s globstar nullglob
+          packages=(./nupkgs/**/*.nupkg)
+          if [ ${#packages[@]} -eq 0 ]; then echo "::error::No packages to push"; exit 1; fi
+          for package in "${packages[@]}"; do
+            dotnet nuget push "$package" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
 
       - name: Push to GitHub Packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          find ./nupkgs -name "*.nupkg" -exec dotnet nuget push {} \
-            --api-key $GITHUB_TOKEN \
-            --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
-            --skip-duplicate \;
+          shopt -s globstar nullglob
+          packages=(./nupkgs/**/*.nupkg)
+          if [ ${#packages[@]} -eq 0 ]; then echo "::error::No packages to push"; exit 1; fi
+          for package in "${packages[@]}"; do
+            dotnet nuget push "$package" \
+              --api-key "$GITHUB_TOKEN" \
+              --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
+              --skip-duplicate
+          done
 
       - name: Publish for Linux (linux-x64)
         run: dotnet publish src/Linker/Linker.csproj -c Release -r linux-x64 --self-contained true -o out-linux

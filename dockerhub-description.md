@@ -66,4 +66,4 @@ For TLS connections add `certificateFile` and `privateKeyFile` pointing to PEM f
 ## Links
 
 - **GitHub**: https://github.com/riccardone/Linker
-- **NuGet** (programmatic use): `Linker.Core`
+- **NuGet** (programmatic use): [Linker.KurrentDB](https://www.nuget.org/packages/Linker.KurrentDB)
